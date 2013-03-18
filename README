@@ -1,0 +1,12 @@
+MPTP - Multiparty Transport Protocol implementation in the Linux kernel
+
+MPTP is a multiparty protocol implemented at Tranport Layer (layer 4)
+in the OSI stack. It is a form of BitTorrent in kernel space.
+
+Top level directory structure:
+
+/README: this file
+
+/src/kernel/: kernel implementaion of MPTP
+
+/test/: tests
