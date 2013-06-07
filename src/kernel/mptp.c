@@ -129,8 +129,9 @@ static int mptp_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	return err;
 }
 
-static int mptp_connect(struct socket *sock, struct sockaddr *addr,
-			int addr_len, int flags)
+static int
+mptp_connect(struct socket *sock, struct sockaddr *addr,
+	     int addr_len, int flags)
 {
 	int err;
 	struct sock *sk;
@@ -205,12 +206,14 @@ static int mptp_connect(struct socket *sock, struct sockaddr *addr,
 	return err;
 }
 
-static int mptp_sendmsg(struct kiocb *iocb, struct socket *sock,
-			struct msghdr *msg, size_t len)
+static int
+mptp_sendmsg(struct kiocb *iocb, struct socket *sock,
+	     struct msghdr *msg, size_t len)
 {
 	int err;
 	uint16_t dport;
 	__be32 daddr;
+	__be32 saddr;
 	uint16_t sport;
 	struct sk_buff *skb;
 	struct sock *sk;
@@ -219,136 +222,181 @@ static int mptp_sendmsg(struct kiocb *iocb, struct socket *sock,
 	struct mptphdr *shdr;
 	int connected = 0;
 	int totlen;
-	struct rtable *rt = NULL;
 	int dests = 0;
 	int i;
 	struct sockaddr_mptp *mptp_addr = NULL;
 	int ret = 0;
 
-    if (unlikely(sock == NULL)) {
-        log_error("Sock is NULL\n");
-        err = -EINVAL;
-        goto out;
-    }
-    sk = sock->sk;
+	if (unlikely(sock == NULL)) {
+		log_error("Sock is NULL\n");
+		err = -EINVAL;
+		goto out;
+	}
+	sk = sock->sk;
 
-    if (unlikely(sk == NULL)) {
-        log_error("Sock->sk is NULL\n");
-        err = -EINVAL;
-        goto out;
-    }
+	if (unlikely(sk == NULL)) {
+		log_error("Sock->sk is NULL\n");
+		err = -EINVAL;
+		goto out;
+	}
 
-    isk = inet_sk(sk);
-    ssk = mptp_sk(sk);
+	isk = inet_sk(sk);
+	ssk = mptp_sk(sk);
 
-    sport = ssk->src;
-    if (sport == 0) {
-        sport = get_next_free_port();
-        if (unlikely(sport == 0)) {
-            log_error("No free ports\n");
-            err = -ENOMEM;
-            goto out;
-        }
-    }
+	sport = ssk->src;
+	saddr = isk->inet_saddr;
 
-    if (msg->msg_name) {
-        mptp_addr = (struct sockaddr_mptp *) msg->msg_name;
+	if (sport == 0) {
+		sport = get_next_free_port();
+		if (unlikely(sport == 0)) {
+			log_error("No free ports\n");
+			err = -ENOMEM;
+			goto out;
+		}
+	}
 
-        if (unlikely(msg->msg_namelen < sizeof(*mptp_addr) + mptp_addr->count * sizeof(struct mptp_dest) || 
-                     mptp_addr->count <= 0)) {
-            log_error("Invalid size for msg_name (size=%u, addr_count=%u)\n", msg->msg_namelen, mptp_addr->count);
-            err = -EINVAL;
-            goto out;
-        }
+	if (msg->msg_name) {
+		mptp_addr = (struct sockaddr_mptp *)msg->msg_name;
 
-        dests = mptp_addr->count;
-    } else {
-        BUG();
-        if (unlikely(!ssk->dst || !isk->inet_daddr)) {
-            log_error("No destination port/address\n");
-            err = -EDESTADDRREQ;
-            goto out;
-        }
-        dport = ssk->dst;
-        daddr = isk->inet_daddr;
+		if (unlikely
+		    (msg->msg_namelen <
+		     sizeof(*mptp_addr) +
+		     mptp_addr->count * sizeof(struct mptp_dest)
+		     || mptp_addr->count <= 0)) {
+			log_error
+			    ("Invalid size for msg_name (size=%u, addr_count=%u)\n",
+			     msg->msg_namelen, mptp_addr->count);
+			err = -EINVAL;
+			goto out;
+		}
 
-        log_debug("Got from socket destination port=%u and address=%u\n", dport, daddr);
-        connected = 1;
-    }
+		dests = mptp_addr->count;
+	} else {
+		BUG();
+		if (unlikely(!ssk->dst || !isk->inet_daddr)) {
+			log_error("No destination port/address\n");
+			err = -EDESTADDRREQ;
+			goto out;
+		}
+		dport = ssk->dst;
+		daddr = isk->inet_daddr;
 
-    if (msg->msg_iovlen < dests)
-        dests = msg->msg_iovlen;
+		log_debug
+		    ("Got from socket destination port=%u and address=%u\n",
+		     dport, daddr);
+		connected = 1;
+	}
 
-    for (i = 0; i < dests; i++) {
-        struct mptp_dest *dest = &mptp_addr->dests[i];
-        struct iovec *iov = &msg->msg_iov[i];
-        char *payload;
+	if (msg->msg_iovlen < dests)
+		dests = msg->msg_iovlen;
 
-        dport = ntohs(dest->port);
-        if (unlikely(dport == 0 || dport >= MAX_MPTP_PORT)) {
-            log_error("Invalid value for destination port(%u)\n", dport);
-            err = -EINVAL;
-            goto out;
-        }	
+	for (i = 0; i < dests; i++) {
+		struct rtable *rt = NULL;
+		struct mptp_dest *dest = &mptp_addr->dests[i];
+		struct iovec *iov = &msg->msg_iov[i];
+		char *payload;
 
-        daddr = dest->addr;
-        log_debug("Received from user space destination port=%u and address=%u\n", dport, daddr);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+		struct flowi fl = { };
+#endif
 
-        len = iov->iov_len;
-        totlen = len + sizeof(struct mptphdr) + sizeof(struct iphdr);
-        skb = sock_alloc_send_skb(sk, totlen, msg->msg_flags & MSG_DONTWAIT, &err);
-        if (unlikely(!skb)) {
-            log_error("sock_alloc_send_skb failed\n");
-            goto out;
-        }
-        log_debug("Allocated %u bytes for skb (payload size=%u)\n", totlen, len);
+		dport = ntohs(dest->port);
+		if (unlikely(dport == 0 || dport >= MAX_MPTP_PORT)) {
+			log_error("Invalid value for destination port(%u)\n",
+				  dport);
+			err = -EINVAL;
+			goto out;
+		}
 
-        skb_reset_network_header(skb);
-        skb_reserve(skb, sizeof(struct iphdr));
-        log_debug("Reseted network header\n");
-        skb_reset_transport_header(skb);
-        skb_put(skb, sizeof(struct mptphdr));
-        log_debug("Reseted transport header\n");
+		daddr = dest->addr;
 
-        shdr = (struct mptphdr *) skb_transport_header(skb);
-        shdr->dst = htons(dport);
-        shdr->src = htons(sport);
-        shdr->len = htons(len + sizeof(struct mptphdr));
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+		fl.u.ip4.saddr = saddr;
+		fl.u.ip4.daddr = daddr;
+		fl.flowi_proto = sk->sk_protocol;
+		fl.flowi_flags = inet_sk_flowi_flags(sk);
+#endif
 
-        payload = skb_put(skb, len);
-        log_debug("payload=%p\n", payload);
+		log_debug
+		    ("Received from user space destination port=%u and address=%u\n",
+		     dport, daddr);
 
-        err = skb_copy_datagram_from_iovec(skb, sizeof(struct mptphdr), iov, 0, len);
-        if (unlikely(err)) {
-            log_error("skb_copy_datagram_from_iovec failed\n");
-            goto out_free;
-        }
-        log_debug("Copied %u bytes into the skb\n", len);
+		len = iov->iov_len;
+		totlen = len + sizeof(struct mptphdr) + sizeof(struct iphdr);
+		skb =
+		    sock_alloc_send_skb(sk, totlen,
+					msg->msg_flags & MSG_DONTWAIT, &err);
+		if (unlikely(!skb)) {
+			log_error("sock_alloc_send_skb failed\n");
+			goto out;
+		}
+		log_debug("Allocated %u bytes for skb (payload size=%u)\n",
+			  totlen, len);
 
-        if (connected)
-            rt = (struct rtable *) __sk_dst_check(sk, 0);
+		skb_reset_network_header(skb);
+		skb_reserve(skb, sizeof(struct iphdr));
+		log_debug("Reseted network header\n");
+		skb_reset_transport_header(skb);
+		skb_put(skb, sizeof(struct mptphdr));
+		log_debug("Reseted transport header\n");
 
-        if (rt == NULL) {
-            struct flowi fl = { .fl4_dst = daddr,
-                .proto = sk->sk_protocol,
-                .flags = inet_sk_flowi_flags(sk),
-            };
-            err = ip_route_output_flow(sock_net(sk), &rt, &fl, sk, 0);
-            if (unlikely(err)) {
-                log_error("Route lookup failed\n");
-                goto out_free;
-            }
+		shdr = (struct mptphdr *)skb_transport_header(skb);
+		shdr->dst = htons(dport);
+		shdr->src = htons(sport);
+		shdr->len = htons(len + sizeof(struct mptphdr));
+
+		payload = skb_put(skb, len);
+		log_debug("payload=%p\n", payload);
+
+		err =
+		    skb_copy_datagram_from_iovec(skb, sizeof(struct mptphdr),
+						 iov, 0, len);
+		if (unlikely(err)) {
+			log_error("skb_copy_datagram_from_iovec failed\n");
+			goto out_free;
+		}
+		log_debug("Copied %u bytes into the skb\n", len);
+
+		if (connected)
+			rt = (struct rtable *)__sk_dst_check(sk, 0);
+
+		if (rt == NULL) {
+			log_debug("rt == NULL\n");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+			struct flowi fl = {.fl4_dst = daddr,
+				.proto = sk->sk_protocol,
+				.flags = inet_sk_flowi_flags(sk),
+			};
+			err =
+			    ip_route_output_flow(sock_net(sk), &rt, &fl, sk, 0);
+			if (unlikely(err)) {
+				log_error("Route lookup failed\n");
+				goto out_free;
+			}
+#else
+			rt = ip_route_output_flow(sock_net(sk), &fl.u.ip4, sk);
+			log_debug("rt = %p\n", rt);
+			if (IS_ERR(rt)) {
+				log_error("Route lookup failed\n");
+				goto out_free;
+			}
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 36)
 			sk_dst_set(sk, dst_clone(&rt->u.dst));
 #else
 			sk_dst_set(sk, dst_clone(&rt->dst));
 #endif
 		}
+		log_debug("rt != NULL\n");
 
-        skb->local_df = 1;
-        err = ip_queue_xmit(skb);
-        if (likely(!err)) {
-            log_debug("Sent %u bytes on wire\n", len);
+		skb->local_df = 1;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+		err = ip_queue_xmit(skb);
+#else
+		err = ip_queue_xmit(skb, &fl);
+#endif
+		if (likely(!err)) {
+			log_debug("Sent %u bytes on wire\n", len);
 			ret += len;
 			dest->bytes = len;
 		} else {
@@ -366,8 +414,9 @@ static int mptp_sendmsg(struct kiocb *iocb, struct socket *sock,
 	return err;
 }
 
-static int mptp_recvmsg(struct kiocb *iocb, struct socket *sock,
-			struct msghdr *msg, size_t len, int flags)
+static int
+mptp_recvmsg(struct kiocb *iocb, struct socket *sock,
+	     struct msghdr *msg, size_t len, int flags)
 {
 	struct sk_buff *skb;
 	struct sockaddr_mptp *mptp_addr;
@@ -505,6 +554,7 @@ static int mptp_rcv(struct sk_buff *skb)
 #else
 	err = sock_queue_rcv_skb((struct sock *)&ssk->sock, skb);
 #endif
+
 	if (unlikely(err)) {
 		log_error("ip_queue_rcv_skb failed with %d\n", err);
 		consume_skb(skb);
